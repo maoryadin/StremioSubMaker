@@ -36,16 +36,16 @@ class FallbackTranslationProvider {
     return err;
   }
 
-  async translateSubtitle(subtitleContent, sourceLanguage, targetLanguage, customPrompt = null) {
+  async translateSubtitle(subtitleContent, sourceLanguage, targetLanguage, customPrompt = null, requestOptions = {}) {
     try {
-      return await this.primary.translateSubtitle(subtitleContent, sourceLanguage, targetLanguage, customPrompt);
+      return await this.primary.translateSubtitle(subtitleContent, sourceLanguage, targetLanguage, customPrompt, requestOptions);
     } catch (primaryError) {
       if (!this.fallback || typeof this.fallback.translateSubtitle !== 'function') {
         throw primaryError;
       }
       log.warn(() => [`[Providers] Primary ${this.primaryName} failed, trying secondary ${this.fallbackName}:`, this.formatError(primaryError)]);
       try {
-        const translated = await this.fallback.translateSubtitle(subtitleContent, sourceLanguage, targetLanguage, customPrompt);
+        const translated = await this.fallback.translateSubtitle(subtitleContent, sourceLanguage, targetLanguage, customPrompt, requestOptions);
         log.info(() => `[Providers] Secondary ${this.fallbackName} succeeded after ${this.primaryName} failure`);
         return translated;
       } catch (secondaryError) {
@@ -55,17 +55,17 @@ class FallbackTranslationProvider {
     }
   }
 
-  async streamTranslateSubtitle(subtitleContent, sourceLanguage, targetLanguage, customPrompt = null, onPartial = null) {
+  async streamTranslateSubtitle(subtitleContent, sourceLanguage, targetLanguage, customPrompt = null, onPartial = null, requestOptions = {}) {
     if (typeof this.primary.streamTranslateSubtitle === 'function') {
       try {
-        return await this.primary.streamTranslateSubtitle(subtitleContent, sourceLanguage, targetLanguage, customPrompt, onPartial);
+        return await this.primary.streamTranslateSubtitle(subtitleContent, sourceLanguage, targetLanguage, customPrompt, onPartial, requestOptions);
       } catch (primaryError) {
         if (!this.fallback) {
           throw primaryError;
         }
         log.warn(() => `[Providers] Primary ${this.primaryName} stream failed, falling back to ${this.fallbackName} (non-stream)`);
         try {
-          const full = await this.fallback.translateSubtitle(subtitleContent, sourceLanguage, targetLanguage, customPrompt);
+          const full = await this.fallback.translateSubtitle(subtitleContent, sourceLanguage, targetLanguage, customPrompt, requestOptions);
           if (typeof onPartial === 'function') {
             try { await onPartial(full); } catch (_) { }
           }
@@ -77,7 +77,7 @@ class FallbackTranslationProvider {
       }
     }
     // If primary does not support streaming, use translateSubtitle (includes fallback handling)
-    return this.translateSubtitle(subtitleContent, sourceLanguage, targetLanguage, customPrompt);
+    return this.translateSubtitle(subtitleContent, sourceLanguage, targetLanguage, customPrompt, requestOptions);
   }
 
   async countTokensForTranslation(...args) {

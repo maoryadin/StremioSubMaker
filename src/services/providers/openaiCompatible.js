@@ -12,6 +12,7 @@ const {
 } = require('../../utils/languages');
 const { resolveLanguageDisplayName } = require('../../utils/languageResolver');
 const { normalizeTargetLanguageForPrompt } = require('../utils/normalizeTargetLanguageForPrompt');
+const { buildOpenAISubtitleSchema } = require('../utils/structuredOutput');
 const {
   getProviderAuthFailureCacheKey,
   hasCachedProviderAuthFailure,
@@ -261,16 +262,17 @@ class OpenAICompatibleProvider {
 
     // JSON structured output mode for OpenAI-compatible APIs
     if (!isCfRun && this.enableJsonOutput && !disableStructuredOutput) {
+      const expectedCount = meta?.expectedCount;
       // DeepSeek does not support json_schema (strict) — use json_object instead.
       // Tested: both deepseek-chat and deepseek-reasoner accept json_object and reject json_schema.
       if (this.providerName === 'deepseek') {
         body.response_format = { type: 'json_object' };
       } else if (isOpenAI && useResponsesApi) {
         body.text = {
-          format: this.buildResponsesJsonSchemaFormat()
+          format: this.buildResponsesJsonSchemaFormat(expectedCount)
         };
       } else {
-        body.response_format = this.buildChatJsonSchemaResponseFormat();
+        body.response_format = this.buildChatJsonSchemaResponseFormat(expectedCount);
       }
     }
 
@@ -405,49 +407,31 @@ class OpenAICompatibleProvider {
     return raw;
   }
 
-  buildSubtitleEntriesJsonSchema() {
-    const entrySchema = {
-      type: 'object',
-      properties: {
-        id: { type: 'integer' },
-        text: { type: 'string' }
-      },
-      required: ['id', 'text'],
-      additionalProperties: false
-    };
-
+  buildSubtitleEntriesJsonSchema(expectedCount) {
     // OpenAI strict structured outputs require a root object, not a root array.
     // The TranslationEngine parser already accepts this { entries: [...] } envelope.
-    return {
-      type: 'object',
-      properties: {
-        entries: {
-          type: 'array',
-          items: entrySchema
-        }
-      },
-      required: ['entries'],
-      additionalProperties: false
-    };
+    // When expectedCount is supplied, the array length is pinned so the model cannot
+    // return the wrong number of cues.
+    return buildOpenAISubtitleSchema(expectedCount);
   }
 
-  buildChatJsonSchemaResponseFormat() {
+  buildChatJsonSchemaResponseFormat(expectedCount) {
     return {
       type: 'json_schema',
       json_schema: {
         name: 'subtitle_entries',
         strict: true,
-        schema: this.buildSubtitleEntriesJsonSchema()
+        schema: this.buildSubtitleEntriesJsonSchema(expectedCount)
       }
     };
   }
 
-  buildResponsesJsonSchemaFormat() {
+  buildResponsesJsonSchemaFormat(expectedCount) {
     return {
       type: 'json_schema',
       name: 'subtitle_entries',
       strict: true,
-      schema: this.buildSubtitleEntriesJsonSchema()
+      schema: this.buildSubtitleEntriesJsonSchema(expectedCount)
     };
   }
 
@@ -703,7 +687,8 @@ class OpenAICompatibleProvider {
             subtitleContent,
             sourceLanguage,
             targetLanguage,
-            disableStructuredOutput
+            disableStructuredOutput,
+            expectedCount: requestOptions?.expectedCount
           }
         );
         const agents = this.getHttpAgents();
@@ -772,7 +757,8 @@ class OpenAICompatibleProvider {
         subtitleContent,
         sourceLanguage,
         targetLanguage,
-        disableStructuredOutput: requestOptions?.disableStructuredOutput === true
+        disableStructuredOutput: requestOptions?.disableStructuredOutput === true,
+        expectedCount: requestOptions?.expectedCount
       }
     );
 

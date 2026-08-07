@@ -23,6 +23,8 @@ const crypto = require('crypto');
 const log = require('../utils/logger');
 const { handleCaughtError } = require('../utils/errorClassifier');
 const { normalizeTargetLanguageForPrompt } = require('./utils/normalizeTargetLanguageForPrompt');
+const { STRUCTURED_ITEM_COUNT_LIMIT } = require('./utils/structuredOutput');
+const { getAllowedScripts, findForeignScripts, extractForeignRuns } = require('../utils/scriptIntegrity');
 const { recordKeyError: recordKeyErrorRedis, isKeyCoolingDown: isKeyCoolingDownRedis, getNextRotationIndex, resetKeyHealth } = require('../utils/sharedCache');
 const { executeParallelTranslation } = require('../utils/parallelTranslation');
 
@@ -193,13 +195,13 @@ class TranslationEngine {
       this.translationWorkflow = 'json';
       this.sendTimestampsToAI = false;
     }
-
-    // JSON workflow caps batch size — large JSON arrays (300-400 objects)
-    // are extremely error-prone for LLMs. Keep batches at ≤200 entries.
-    const JSON_MAX_BATCH_SIZE = 200;
-    if (this.translationWorkflow === 'json' && this.batchSize > JSON_MAX_BATCH_SIZE) {
-      log.debug(() => `[TranslationEngine] Capping batch size from ${this.batchSize} to ${JSON_MAX_BATCH_SIZE} for JSON workflow`);
-      this.batchSize = JSON_MAX_BATCH_SIZE;
+    // JSON workflow caps batch size — large JSON arrays are error-prone for LLMs, and
+    // the structured-output schema can only pin the entry count up to
+    // STRUCTURED_ITEM_COUNT_LIMIT (Gemini rejects minItems/maxItems above it).
+    // Staying at or below that limit is what makes count mismatches impossible.
+    if (this.translationWorkflow === 'json' && this.batchSize > STRUCTURED_ITEM_COUNT_LIMIT) {
+      log.debug(() => `[TranslationEngine] Capping batch size from ${this.batchSize} to ${STRUCTURED_ITEM_COUNT_LIMIT} for JSON workflow`);
+      this.batchSize = STRUCTURED_ITEM_COUNT_LIMIT;
     }
 
     // Force workflow to 'original' for non-LLM providers — XML/AI/JSON workflows are LLM-only
@@ -288,6 +290,9 @@ class TranslationEngine {
       recoveredEntries: 0,
       entryCount: 0,
       batchCount: 0,
+      // Foreign-script contamination (e.g. Arabic codepoints inside Hebrew output)
+      scriptCorruptionDetected: 0,
+      scriptCorruptionRepaired: 0,
       // Tier 3: Configuration context
       jsonXmlFallback: false,
       workflow: this.translationWorkflow,
@@ -529,28 +534,32 @@ class TranslationEngine {
   /**
    * Perform a translation call, using streaming or non-streaming based on the provided flag.
    * Centralizes the call pattern so retry paths don't accidentally drop streaming.
-   * @param {string} batchText
+   * @param {string} batchText - Batch payload; the provider appends it to the prompt exactly once
    * @param {string} targetLanguage
-   * @param {string} prompt
+   * @param {string} prompt - Instruction block (no payload embedded)
    * @param {boolean} useStreaming - Whether to use streaming
    * @param {Function|null} onStreamChunk - Streaming progress callback (only used when useStreaming=true)
+   * @param {number} [expectedCount] - Cue count for this call; pins the structured-output array length
    * @returns {Promise<string>}
    */
-  async _translateCall(batchText, targetLanguage, prompt, useStreaming, onStreamChunk) {
+  async _translateCall(batchText, targetLanguage, prompt, useStreaming, onStreamChunk, expectedCount) {
+    const requestOptions = Number.isInteger(expectedCount) ? { expectedCount } : {};
     if (useStreaming && typeof this.gemini.streamTranslateSubtitle === 'function') {
       return this.gemini.streamTranslateSubtitle(
         batchText,
         'detected',
         targetLanguage,
         prompt,
-        onStreamChunk || null
+        onStreamChunk || null,
+        requestOptions
       );
     }
     return this.gemini.translateSubtitle(
       batchText,
       'detected',
       targetLanguage,
-      prompt
+      prompt,
+      requestOptions
     );
   }
 
@@ -571,20 +580,45 @@ class TranslationEngine {
 
   _isStructuredOutputCapabilityError(error) {
     if (!error) return false;
-    const status = error.statusCode || error.status || error.response?.status || 0;
-    const raw =
-      error.message ||
-      error.response?.data?.error?.message ||
-      error.response?.data?.message ||
-      '';
-    const msg = String(raw).toLowerCase();
+    // Provider wrappers can preserve the API error through more than one
+    // originalError layer. Inspect the short chain so structured markers survive
+    // normalization without treating every generic 400 as a schema failure.
+    const errorChain = [];
+    const seen = new Set();
+    let current = error;
+    while (current && !seen.has(current) && errorChain.length < 4) {
+      errorChain.push(current);
+      seen.add(current);
+      current = current.originalError;
+    }
 
-    const statusSuggestsRequestIssue = status === 400 || status === 404 || status === 405 || status === 415 || status === 422 || status === 501;
+    const statuses = [];
+    const messages = [];
+    for (const item of errorChain) {
+      statuses.push(
+        item.statusCode,
+        item.status,
+        item.response?.status
+      );
+      messages.push(
+        item.message,
+        item.response?.data?.error?.message,
+        item.response?.data?.message
+      );
+    }
+
+    const status = statuses.find(value => Number.isInteger(value) && value > 0) || 0;
+    const msg = messages.filter(Boolean).join(' ').toLowerCase();
+    const statusSuggestsRequestIssue = [400, 404, 405, 415, 422, 501].includes(status);
     const mentionsStructuredFeature =
       msg.includes('response_format') ||
       msg.includes('json_schema') ||
       msg.includes('json_object') ||
       msg.includes('structured output') ||
+      msg.includes('response schema') ||
+      msg.includes('responseschema') ||
+      msg.includes('response mime type') ||
+      msg.includes('responsemimetype') ||
       msg.includes('does not support') ||
       msg.includes('unsupported') ||
       msg.includes('unknown parameter');
@@ -629,8 +663,8 @@ class TranslationEngine {
       this._collectStructuredToggleTargets(this.gemini, structuredToggleChanges, false);
 
       const xmlBatchText = this.prepareBatchContent(batch, context);
-      const xmlPrompt = this.createPromptForWorkflow(xmlBatchText, targetLanguage, customPrompt, batch.length, context, batchIndex, totalBatches);
-      const xmlText = await this._translateCall(xmlBatchText, targetLanguage, xmlPrompt, false, null);
+      const xmlPrompt = this.createPromptForWorkflow(targetLanguage, customPrompt, batch.length, context, batchIndex, totalBatches);
+      const xmlText = await this._translateCall(xmlBatchText, targetLanguage, xmlPrompt, false, null, batch.length);
       const xmlEntries = this.parseResponseForWorkflow(xmlText, batch.length, batch);
       if (!xmlEntries || xmlEntries.length === 0) {
         return null;
@@ -866,7 +900,7 @@ class TranslationEngine {
 
     const fullBatchText = this.prepareBatchContent(entries, null);
 
-    const promptForCache = this.createPromptForWorkflow(fullBatchText, targetLanguage, customPrompt, entries.length, null, 0, 1);
+    const promptForCache = this.createPromptForWorkflow(targetLanguage, customPrompt, entries.length, null, 0, 1);
 
     let actualTokenCount = null;
     try {
@@ -891,6 +925,16 @@ class TranslationEngine {
     let chunkCount = Math.max(1, Math.ceil(estimatedTokens / softLimit));
     // Never create more chunks than entries (prevents empty chunks on tiny files)
     chunkCount = Math.min(chunkCount, Math.max(1, entries.length));
+    // Single-batch mode bypasses createBatches(), so enforce the Gemini structured
+    // array limit here as well. Without this, a token-light file could send one
+    // JSON request with hundreds of entries and lose exact count pinning.
+    if (this.translationWorkflow === 'json' && entries.length > STRUCTURED_ITEM_COUNT_LIMIT) {
+      const countBound = Math.ceil(entries.length / STRUCTURED_ITEM_COUNT_LIMIT);
+      if (chunkCount < countBound) {
+        log.debug(() => `[TranslationEngine] Splitting single-batch JSON workflow into ${countBound} count-bounded chunks`);
+        chunkCount = countBound;
+      }
+    }
 
     if (chunkCount > 1) {
       const basis = actualTokenCount ? 'actual' : 'estimated';
@@ -1086,7 +1130,7 @@ class TranslationEngine {
 
     // Prepare batch text (with context if provided)
     const batchText = this.prepareBatchContent(batch, context);
-    const prompt = this.createPromptForWorkflow(batchText, targetLanguage, customPrompt, batch.length, context, batchIndex, totalBatches);
+    const prompt = this.createPromptForWorkflow(targetLanguage, customPrompt, batch.length, context, batchIndex, totalBatches);
 
     // Fix #8 (v1.4.38+): tryFallback closure moved AFTER batchText/prompt declarations.
     // This makes variable dependencies explicit and avoids reliance on JavaScript hoisting.
@@ -1108,7 +1152,8 @@ class TranslationEngine {
           fallbackContent,
           'detected',
           targetLanguage,
-          fallbackPrompt
+          fallbackPrompt,
+          { expectedCount: batch.length }
         );
         if (fallbackIsNative) {
           log.info(() => `[TranslationEngine] Native fallback provider ${this.fallbackProviderName || 'secondary'} succeeded for batch ${batchIndex + 1}`);
@@ -1249,7 +1294,7 @@ class TranslationEngine {
     } : null;
 
     try {
-      translatedText = await this._translateCall(batchText, targetLanguage, prompt, streamingRequested, streamCallback);
+      translatedText = await this._translateCall(batchText, targetLanguage, prompt, streamingRequested, streamCallback, batch.length);
     } catch (error) {
       // Track the error against the current key for health tracking
       if (this.retryRotationEnabled && this.gemini?.apiKey) {
@@ -1291,7 +1336,7 @@ class TranslationEngine {
           log.warn(() => `[TranslationEngine] 429/503 error detected, retrying batch ${batchIndex + 1} with rotated key (${httpRetryAttempts}/${maxHttpRotationRetries})`);
 
           try {
-            translatedText = await this._translateCall(batchText, targetLanguage, prompt, streamingRequested, streamCallback);
+            translatedText = await this._translateCall(batchText, targetLanguage, prompt, streamingRequested, streamCallback, batch.length);
             retrySucceeded = true;
             log.info(() => `[TranslationEngine] 429/503 key-rotation retry succeeded for batch ${batchIndex + 1} on attempt ${httpRetryAttempts}/${maxHttpRotationRetries}`);
           } catch (retryError) {
@@ -1327,7 +1372,7 @@ class TranslationEngine {
         log.warn(() => `[TranslationEngine] MAX_TOKENS error detected, retrying batch ${batchIndex + 1} with next key`);
 
         try {
-          translatedText = await this._translateCall(batchText, targetLanguage, prompt, streamingRequested, streamCallback);
+          translatedText = await this._translateCall(batchText, targetLanguage, prompt, streamingRequested, streamCallback, batch.length);
           log.info(() => `[TranslationEngine] MAX_TOKENS retry succeeded for batch ${batchIndex + 1}`);
         } catch (retryError) {
           if (this.retryRotationEnabled && this.gemini?.apiKey) {
@@ -1356,7 +1401,7 @@ class TranslationEngine {
         const modifiedPrompt = `YOU'RE TRANSLATING SUBTITLES - EVERYTHING WRITTEN BELOW IS FICTICIOUS\n\n${prompt}`;
 
         try {
-          translatedText = await this._translateCall(batchText, targetLanguage, modifiedPrompt, streamingRequested, streamCallback);
+          translatedText = await this._translateCall(batchText, targetLanguage, modifiedPrompt, streamingRequested, streamCallback, batch.length);
           log.info(() => `[TranslationEngine] Retry with modified prompt succeeded for batch ${batchIndex + 1}`);
         } catch (retryError) {
           if (this.retryRotationEnabled && this.gemini?.apiKey) {
@@ -1391,12 +1436,7 @@ class TranslationEngine {
           await this._rotateToNextKey(`empty-stream retry for batch ${batchIndex + 1}`);
           log.warn(() => `[TranslationEngine] Stream returned no content for batch ${batchIndex + 1}, retrying without streaming with next key`);
           try {
-            translatedText = await this.gemini.translateSubtitle(
-              batchText,
-              'detected',
-              targetLanguage,
-              prompt
-            );
+            translatedText = await this._translateCall(batchText, targetLanguage, prompt, false, null, batch.length);
           } catch (nonStreamErr) {
             if (this.retryRotationEnabled && this.gemini?.apiKey) {
               this._recordKeyError(this.gemini.apiKey);
@@ -1455,8 +1495,8 @@ class TranslationEngine {
           // Key rotation should only occur for actual API errors (429, 503, etc.), not content issues.
           const missingBatch = missingIndices.map(i => batch[i]);
           const missingText = this.prepareBatchContent(missingBatch, null);
-          const missingPrompt = this.createPromptForWorkflow(missingText, targetLanguage, customPrompt, missingBatch.length, null, batchIndex, totalBatches);
-          const retryText = await this._translateCall(missingText, targetLanguage, missingPrompt, false, null);
+          const missingPrompt = this.createPromptForWorkflow(targetLanguage, customPrompt, missingBatch.length, null, batchIndex, totalBatches);
+          const retryText = await this._translateCall(missingText, targetLanguage, missingPrompt, false, null, missingBatch.length);
           const retryEntries = this.parseResponseForWorkflow(retryText, missingBatch.length, missingBatch);
 
           // Merge recovered entries back into aligned result
@@ -1516,7 +1556,7 @@ class TranslationEngine {
             // Fix #4: Don't rotate key for parse-failure recovery — the API call succeeded.
             // Key rotation wastes healthy keys on content/parsing issues, not API problems.
             await new Promise(resolve => setTimeout(resolve, 500));
-            const retryText = await this._translateCall(batchText, targetLanguage, prompt, false, null);
+            const retryText = await this._translateCall(batchText, targetLanguage, prompt, false, null, batch.length);
             const retryEntries = this.parseResponseForWorkflow(retryText, batch.length, batch);
             if (retryEntries.length === batch.length) {
               translatedEntries = retryEntries;
@@ -1571,6 +1611,14 @@ class TranslationEngine {
       }
     }
 
+    // Foreign-script contamination repair.
+    // LLMs occasionally splice a character from an adjacent script into a word
+    // (observed: Arabic codepoints inside Hebrew output, ~2% of cues). The API call
+    // succeeded and the count is right, so no existing recovery path catches it.
+    translatedEntries = await this._repairForeignScriptEntries(
+      translatedEntries, batch, targetLanguage, customPrompt, batchIndex, totalBatches
+    );
+
     // Cache individual entries
     if (CACHE_TRANSLATIONS) {
       for (let i = 0; i < batch.length && i < translatedEntries.length; i++) {
@@ -1583,6 +1631,82 @@ class TranslationEngine {
     // instead of waiting for the full 1-hour cooldown
     if (this.retryRotationEnabled && this.gemini?.apiKey) {
       this._resetKeyHealthOnSuccess(this.gemini.apiKey);
+    }
+
+    return translatedEntries;
+  }
+
+  /**
+   * Re-translate cues whose output contains characters from a script the target
+   * language does not use and the source cue did not contain.
+   *
+   * Only the offending cues are re-sent, so the cost is proportional to the damage
+   * (typically 1-4 cues out of a 149-cue batch) rather than a whole-batch retry.
+   * A cue that is still contaminated after one retry keeps the original result;
+   * the repair is best-effort and must never discard usable translation text.
+   *
+   * @param {Array} translatedEntries - parsed entries, aligned to `batch` by index
+   * @param {Array} batch - source cues
+   * @param {string} targetLanguage
+   * @param {string|null} customPrompt
+   * @param {number} batchIndex
+   * @param {number} totalBatches
+   * @returns {Promise<Array>} entries with repairs applied where possible
+   */
+  async _repairForeignScriptEntries(translatedEntries, batch, targetLanguage, customPrompt, batchIndex, totalBatches) {
+    const allowedScripts = getAllowedScripts(targetLanguage);
+    if (!allowedScripts || !Array.isArray(translatedEntries) || translatedEntries.length === 0) {
+      return translatedEntries;
+    }
+
+    // Locate contaminated entries. `index` is the position within `batch`.
+    const damaged = [];
+    for (const entry of translatedEntries) {
+      const sourceIdx = typeof entry?.index === 'number' ? entry.index : -1;
+      const source = batch[sourceIdx];
+      if (!source || typeof entry.text !== 'string') continue;
+      const offending = findForeignScripts(source.text, entry.text, allowedScripts);
+      if (offending.length > 0) {
+        damaged.push({ entry, source, sourceIdx, offending });
+      }
+    }
+
+    if (damaged.length === 0) return translatedEntries;
+
+    this.translationStats.scriptCorruptionDetected += damaged.length;
+    log.warn(() => `[TranslationEngine] Foreign-script contamination in ${damaged.length}/${batch.length} entries of batch ${batchIndex + 1}: ${damaged.slice(0, 3).map(d => `[${d.sourceIdx + 1}] ${extractForeignRuns(d.entry.text, d.offending).join('')}`).join(', ')}`);
+
+    try {
+      const retryBatch = damaged.map(d => d.source);
+      const retryText = await this._translateCall(
+        this.prepareBatchContent(retryBatch, null),
+        targetLanguage,
+        this.createPromptForWorkflow(targetLanguage, customPrompt, retryBatch.length, null, batchIndex, totalBatches),
+        false,
+        null,
+        retryBatch.length
+      );
+      const retryEntries = this.parseResponseForWorkflow(retryText, retryBatch.length, retryBatch);
+
+      let repaired = 0;
+      for (let i = 0; i < damaged.length; i++) {
+        // parseResponseForWorkflow returns indices relative to the retry mini-batch
+        const replacement = retryEntries.find(e => e.index === i);
+        if (!replacement || typeof replacement.text !== 'string' || !replacement.text.trim()) continue;
+        if (findForeignScripts(damaged[i].source.text, replacement.text, allowedScripts).length > 0) continue;
+        damaged[i].entry.text = replacement.text;
+        repaired++;
+      }
+
+      this.translationStats.scriptCorruptionRepaired += repaired;
+      if (repaired === damaged.length) {
+        log.info(() => `[TranslationEngine] Foreign-script repair: all ${repaired} entries fixed in batch ${batchIndex + 1}`);
+      } else {
+        log.warn(() => `[TranslationEngine] Foreign-script repair: ${repaired}/${damaged.length} fixed in batch ${batchIndex + 1}; the rest kept as-is`);
+      }
+    } catch (err) {
+      // A failed repair must never fail the translation — the original text stands.
+      log.warn(() => `[TranslationEngine] Foreign-script repair call failed for batch ${batchIndex + 1}: ${err.message}`);
     }
 
     return translatedEntries;
@@ -1609,7 +1733,9 @@ class TranslationEngine {
       if (this.fallbackProvider) {
         log.warn(() => `[TranslationEngine] Native provider ${this.providerName} failed, trying fallback: ${error.message}`);
         try {
-          translatedText = await this.fallbackProvider.translateSubtitle(srtContent, 'detected', targetLanguage, null);
+          translatedText = await this.fallbackProvider.translateSubtitle(
+            srtContent, 'detected', targetLanguage, null, { expectedCount: batch.length }
+          );
           // Bug 3 fix: set secondary stats (previously missing from native provider fallback path)
           this.translationStats.usedSecondaryProvider = true;
           this.translationStats.secondaryProviderName = this.fallbackProviderName || 'secondary';
@@ -1746,9 +1872,11 @@ class TranslationEngine {
   }
 
   /**
-   * Create translation prompt for XML-tagged batches
+   * Create translation prompt for XML-tagged batches.
+   * Returns instructions ONLY — the provider's buildUserPrompt() appends the batch
+   * payload exactly once. Embedding it here too would ship the subtitles twice.
    */
-  createXmlBatchPrompt(batchText, targetLanguage, customPrompt, expectedCount, context = null, batchIndex = 0, totalBatches = 1) {
+  createXmlBatchPrompt(targetLanguage, customPrompt, expectedCount, context = null, batchIndex = 0, totalBatches = 1) {
     const targetLabel = normalizeTargetLanguageForPrompt(targetLanguage);
 
     let contextInstructions = '';
@@ -1780,12 +1908,9 @@ Do not include any timestamps/timecodes.
 YOUR RESPONSE MUST:
 - Start with <s id="1"> and end with </s> after entry ${expectedCount}
 - Contain ONLY the XML-tagged translated entries
+- Contain EXACTLY ${expectedCount} XML-tagged entries, no more and no fewer
 
-INPUT (${expectedCount} entries):
-
-${batchText}
-
-OUTPUT (EXACTLY ${expectedCount} XML-tagged entries):`;
+The ${expectedCount} entries to translate follow.`;
     return this.addBatchHeader(promptBody, batchIndex, totalBatches);
   }
 
@@ -1814,8 +1939,10 @@ OUTPUT (EXACTLY ${expectedCount} XML-tagged entries):`;
   /**
    * Build a translation prompt for the 'json' workflow.
    * Input is JSON, output must be JSON — no format ambiguity.
+   * Returns instructions ONLY — the provider's buildUserPrompt() appends the batch
+   * payload exactly once.
    */
-  _buildJsonPrompt(batchText, targetLanguage, customPrompt, expectedCount, context = null, batchIndex = 0, totalBatches = 1) {
+  _buildJsonPrompt(targetLanguage, customPrompt, expectedCount, context = null, batchIndex = 0, totalBatches = 1) {
     const targetLabel = normalizeTargetLanguageForPrompt(targetLanguage);
 
     let contextInstructions = '';
@@ -1849,14 +1976,10 @@ TRANSLATION STYLE:
 Do NOT add acknowledgements, explanations, notes, or commentary.
 Do not skip, merge, or split entries. NEVER output markdown.
 
-YOUR RESPONSE MUST be a JSON array: [{"id":1,"text":"..."},{"id":2,"text":"..."}]
-Return ONLY the JSON array with EXACTLY ${expectedCount} entries, no other text.
+YOUR RESPONSE MUST be valid JSON matching the response schema supplied by the provider (root array or an {"entries":[...]} envelope).
+Return ONLY that JSON value with EXACTLY ${expectedCount} entries, no other text.
 
-INPUT (${expectedCount} entries):
-
-${batchText}
-
-OUTPUT (EXACTLY ${expectedCount} entries as JSON array):`;
+The ${expectedCount} entries to translate follow.`;
     return this.addBatchHeader(promptBody, batchIndex, totalBatches);
   }
 
@@ -1933,19 +2056,21 @@ OUTPUT (EXACTLY ${expectedCount} entries as JSON array):`;
   }
 
   /**
-   * Route to the correct prompt creation method based on workflow
+   * Route to the correct prompt creation method based on workflow.
+   * Prompt builders emit instructions only; the batch payload is appended once by
+   * the provider's buildUserPrompt().
    */
-  createPromptForWorkflow(batchText, targetLanguage, customPrompt, expectedCount, context, batchIndex, totalBatches) {
+  createPromptForWorkflow(targetLanguage, customPrompt, expectedCount, context, batchIndex, totalBatches) {
     if (this.translationWorkflow === 'json') {
-      return this._buildJsonPrompt(batchText, targetLanguage, customPrompt, expectedCount, context, batchIndex, totalBatches);
+      return this._buildJsonPrompt(targetLanguage, customPrompt, expectedCount, context, batchIndex, totalBatches);
     }
     if (this.translationWorkflow === 'ai') {
       return this.createTimestampPrompt(targetLanguage, batchIndex, totalBatches);
     }
     if (this.translationWorkflow === 'xml') {
-      return this.createXmlBatchPrompt(batchText, targetLanguage, customPrompt, expectedCount, context, batchIndex, totalBatches);
+      return this.createXmlBatchPrompt(targetLanguage, customPrompt, expectedCount, context, batchIndex, totalBatches);
     }
-    return this.createBatchPrompt(batchText, targetLanguage, customPrompt, expectedCount, context, batchIndex, totalBatches);
+    return this.createBatchPrompt(targetLanguage, customPrompt, expectedCount, context, batchIndex, totalBatches);
   }
 
   /**
@@ -2198,9 +2323,11 @@ OUTPUT (EXACTLY ${expectedCount} entries as JSON array):`;
   }
 
   /**
-   * Create translation prompt for a batch
+   * Create translation prompt for a batch.
+   * Returns instructions ONLY — the provider's buildUserPrompt() appends the batch
+   * payload exactly once.
    */
-  createBatchPrompt(batchText, targetLanguage, customPrompt, expectedCount, context = null, batchIndex = 0, totalBatches = 1) {
+  createBatchPrompt(targetLanguage, customPrompt, expectedCount, context = null, batchIndex = 0, totalBatches = 1) {
     const targetLabel = normalizeTargetLanguageForPrompt(targetLanguage);
 
     let contextInstructions = '';
@@ -2235,13 +2362,9 @@ ${context ? 'Do not translate context entries - only translate numbered entries.
 YOUR RESPONSE MUST:
 - Start immediately with "1." (the first entry)
 - End with "${expectedCount}." (the last entry)
-- Contain NOTHING else
+- Contain EXACTLY ${expectedCount} numbered entries and NOTHING else
 
-INPUT (${expectedCount} entries):
-
-${batchText}
-
-OUTPUT (EXACTLY ${expectedCount} numbered entries, NO OTHER TEXT):`;
+The ${expectedCount} entries to translate follow.`;
     return this.addBatchHeader(promptBody, batchIndex, totalBatches);
   }
 

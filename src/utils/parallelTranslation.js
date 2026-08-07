@@ -153,6 +153,8 @@ async function executeParallelTranslation(engine, entries, targetLanguage, custo
                 keyRotationRetries: 0,
                 errorTypes: [],
                 jsonXmlFallback: false,
+                scriptCorruptionDetected: 0,
+                scriptCorruptionRepaired: 0,
             };
         }
 
@@ -188,6 +190,8 @@ async function executeParallelTranslation(engine, entries, targetLanguage, custo
                 es.keyRotationRetries += (ws.keyRotationRetries || 0);
                 es.missingEntries += (ws.missingEntries || 0);
                 es.recoveredEntries += (ws.recoveredEntries || 0);
+                es.scriptCorruptionDetected = (es.scriptCorruptionDetected || 0) + (ws.scriptCorruptionDetected || 0);
+                es.scriptCorruptionRepaired = (es.scriptCorruptionRepaired || 0) + (ws.scriptCorruptionRepaired || 0);
                 // Merge boolean flags
                 if (ws.usedSecondaryProvider) es.usedSecondaryProvider = true;
                 if (ws.mismatchDetected) es.mismatchDetected = true;

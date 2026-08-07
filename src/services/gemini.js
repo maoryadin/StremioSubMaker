@@ -5,6 +5,7 @@ const { httpAgent, httpsAgent } = require('../utils/httpAgents');
 const log = require('../utils/logger');
 const { resolveLanguageDisplayName } = require('../utils/languageResolver');
 const { normalizeTargetLanguageForPrompt } = require('./utils/normalizeTargetLanguageForPrompt');
+const { buildGeminiSubtitleSchema } = require('./utils/structuredOutput');
 const {
   getProviderAuthFailureCacheKey,
   hasCachedProviderAuthFailure,
@@ -33,6 +34,23 @@ function getGeminiErrorMessage(error) {
     return dataError.message || JSON.stringify(dataError);
   }
   return String(error?.response?.data?.message || error?.message || '');
+}
+
+function isStructuredOutputRequestError(error) {
+  const status = error?.response?.status || error?.statusCode || error?.status || 0;
+  if (![400, 404, 405, 415, 422, 501].includes(status)) return false;
+
+  const message = getGeminiErrorMessage(error).toLowerCase();
+  return (
+    message.includes('invalid argument') ||
+    message.includes('response schema') ||
+    message.includes('responseschema') ||
+    message.includes('response mime type') ||
+    message.includes('responsemimetype') ||
+    message.includes('structured output') ||
+    message.includes('json schema') ||
+    message.includes('json_schema')
+  );
 }
 
 function isGeminiAuthFailure(error) {
@@ -382,7 +400,7 @@ class GeminiService {
    * @param {string} customPrompt - Custom translation prompt (optional)
    * @returns {Promise<string>} - Translated content
    */
-  async translateSubtitle(subtitleContent, sourceLanguage, targetLanguage, customPrompt = null) {
+  async translateSubtitle(subtitleContent, sourceLanguage, targetLanguage, customPrompt = null, requestOptions = {}) {
     return this.retryWithBackoff(async () => {
       try {
         const { userPrompt } = this.buildUserPrompt(subtitleContent, targetLanguage, customPrompt);
@@ -423,11 +441,16 @@ class GeminiService {
           maxOutputTokens: estimatedOutputTokens + thinkingReserve
         };
 
-        // JSON structured output mode
-        // Note: responseMimeType is incompatible with thinkingConfig — when thinking
-        // is enabled the model needs free-form internal reasoning, so skip JSON mode.
-        if (this.enableJsonOutput && thinkingBudget === 0) {
+        // JSON structured output mode.
+        // responseSchema pins the shape, and (when the batch is within the API's
+        // 149-item ceiling) the exact entry count — making a count mismatch
+        // impossible at decode time rather than a parser-recovery problem.
+        // Verified 2026-08-07 that responseSchema and thinkingConfig coexist on
+        // gemini-flash-lite-latest, gemini-3.5-flash and gemini-3-flash-preview,
+        // so this is NOT gated on thinking being disabled.
+        if (this.enableJsonOutput && requestOptions?.disableStructuredOutput !== true) {
           generationConfig.responseMimeType = 'application/json';
+          generationConfig.responseSchema = buildGeminiSubtitleSchema(requestOptions?.expectedCount);
         }
 
         // Add thinking config based on thinking budget setting
@@ -561,9 +584,19 @@ class GeminiService {
 
         const translatedText = aggregatedText.length > 0 ? aggregatedText : candidate.content.parts[0].text;
         return this.cleanTranslatedSubtitle(translatedText);
-
       } catch (error) {
-        // Use centralized error handler
+        if (this.enableJsonOutput
+          && requestOptions?.disableStructuredOutput !== true
+          && isStructuredOutputRequestError(error)) {
+          log.warn(() => '[Gemini] Structured output request rejected, retrying without responseSchema');
+          return this.translateSubtitle(
+            subtitleContent,
+            sourceLanguage,
+            targetLanguage,
+            customPrompt,
+            { ...(requestOptions || {}), disableStructuredOutput: true }
+          );
+        }
         handleTranslationError(error, 'Gemini', { skipResponseData: true });
       }
     });
@@ -572,7 +605,7 @@ class GeminiService {
   /**
    * Stream subtitle translation and yield partial text
    */
-  async streamTranslateSubtitle(subtitleContent, sourceLanguage, targetLanguage, customPrompt = null, onChunk = null) {
+  async streamTranslateSubtitle(subtitleContent, sourceLanguage, targetLanguage, customPrompt = null, onChunk = null, requestOptions = {}) {
     return this.retryWithBackoff(async () => {
       try {
         const { userPrompt } = this.buildUserPrompt(subtitleContent, targetLanguage, customPrompt);
@@ -605,9 +638,11 @@ class GeminiService {
           maxOutputTokens: estimatedOutputTokens + thinkingReserve
         };
 
-        // JSON structured output mode (incompatible with thinking — see translateSubtitle)
-        if (this.enableJsonOutput && thinkingBudget === 0) {
+        // JSON structured output mode — see translateSubtitle() for why this is not
+        // gated on thinking being disabled.
+        if (this.enableJsonOutput && requestOptions?.disableStructuredOutput !== true) {
           generationConfig.responseMimeType = 'application/json';
+          generationConfig.responseSchema = buildGeminiSubtitleSchema(requestOptions?.expectedCount);
         }
 
         if (thinkingBudget === -1) {
@@ -787,8 +822,20 @@ class GeminiService {
 
           response.data.on('error', (err) => reject(err));
         });
-
       } catch (error) {
+        if (this.enableJsonOutput
+          && requestOptions?.disableStructuredOutput !== true
+          && isStructuredOutputRequestError(error)) {
+          log.warn(() => '[Gemini] Structured output stream rejected, retrying without responseSchema');
+          return this.streamTranslateSubtitle(
+            subtitleContent,
+            sourceLanguage,
+            targetLanguage,
+            customPrompt,
+            onChunk,
+            { ...(requestOptions || {}), disableStructuredOutput: true }
+          );
+        }
         handleTranslationError(error, 'Gemini', { skipResponseData: true });
       }
     });
