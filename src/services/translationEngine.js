@@ -23,6 +23,7 @@ const crypto = require('crypto');
 const log = require('../utils/logger');
 const { handleCaughtError } = require('../utils/errorClassifier');
 const { normalizeTargetLanguageForPrompt } = require('./utils/normalizeTargetLanguageForPrompt');
+const { resolveLanguageCode } = require('../utils/languageResolver');
 const { STRUCTURED_ITEM_COUNT_LIMIT } = require('./utils/structuredOutput');
 const { getAllowedScripts, findForeignScripts, extractForeignRuns } = require('../utils/scriptIntegrity');
 const { recordKeyError: recordKeyErrorRedis, isKeyCoolingDown: isKeyCoolingDownRedis, getNextRotationIndex, resetKeyHealth } = require('../utils/sharedCache');
@@ -36,6 +37,51 @@ function tokenizeLanguageValue(value) {
     .toLowerCase()
     .split(/[^a-z0-9+]+/g)
     .filter(Boolean);
+}
+
+// Modern-Hebrew target detection for prompt localization rules.
+// Deliberately excludes Yiddish (yi/yid) and Ancient Hebrew (hbo), which share
+// script/history with Hebrew but are distinct target languages.
+const HEBREW_LANGUAGE_CODES = new Set(['he', 'heb', 'iw']);
+const HEBREW_TRANSLATION_RULES = `HEBREW LOCALIZATION RULES:
+- Maintain consistent character gender, pronouns, verb/adjective forms, and honorifics across the provided entries. When the English source is gender-ambiguous, infer from the available dialogue context and do not switch an established choice within the batch.
+- Use natural contemporary Hebrew subtitle phrasing without niqqud (Hebrew vowel-point diacritics).`;
+
+function isHebrewTargetLanguage(targetLanguage, targetLabel) {
+  const resolvedCode = String(resolveLanguageCode(targetLanguage) || targetLanguage || '')
+    .trim()
+    .toLowerCase()
+    .replace(/_/g, '-');
+  return targetLabel === 'Hebrew'
+    || HEBREW_LANGUAGE_CODES.has(resolvedCode)
+    || resolvedCode.startsWith('he-');
+}
+
+// Composes the configured translation-style prompt and any language-specific
+// localization rules ahead of the workflow's immutable output contract. The
+// workflow contract is always emitted last so it wins any structural conflict
+// with a user-configured prompt.
+function composeWorkflowPrompt(targetLanguage, targetLabel, customPrompt, workflowContract) {
+  const configuredGuidance = typeof customPrompt === 'string'
+    ? customPrompt.trim().split('{target_language}').join(targetLabel)
+    : '';
+  const languageGuidance = isHebrewTargetLanguage(targetLanguage, targetLabel)
+    ? HEBREW_TRANSLATION_RULES
+    : '';
+
+  if (!configuredGuidance && !languageGuidance) {
+    return workflowContract;
+  }
+
+  const sections = [];
+  if (configuredGuidance) {
+    sections.push(`CONFIGURED TRANSLATION GUIDANCE:\n${configuredGuidance}`);
+  }
+  if (languageGuidance) {
+    sections.push(languageGuidance);
+  }
+  sections.push(`WORKFLOW OUTPUT CONTRACT (takes precedence over the guidance above):\n${workflowContract}`);
+  return sections.join('\n\n');
 }
 
 // RTL language detection (codes and human-readable names)
@@ -1911,7 +1957,8 @@ YOUR RESPONSE MUST:
 - Contain EXACTLY ${expectedCount} XML-tagged entries, no more and no fewer
 
 The ${expectedCount} entries to translate follow.`;
-    return this.addBatchHeader(promptBody, batchIndex, totalBatches);
+    const composedPrompt = composeWorkflowPrompt(targetLanguage, targetLabel, customPrompt, promptBody);
+    return this.addBatchHeader(composedPrompt, batchIndex, totalBatches);
   }
 
   /**
@@ -1980,7 +2027,8 @@ YOUR RESPONSE MUST be valid JSON matching the response schema supplied by the pr
 Return ONLY that JSON value with EXACTLY ${expectedCount} entries, no other text.
 
 The ${expectedCount} entries to translate follow.`;
-    return this.addBatchHeader(promptBody, batchIndex, totalBatches);
+    const composedPrompt = composeWorkflowPrompt(targetLanguage, targetLabel, customPrompt, promptBody);
+    return this.addBatchHeader(composedPrompt, batchIndex, totalBatches);
   }
 
   /**
@@ -2065,7 +2113,7 @@ The ${expectedCount} entries to translate follow.`;
       return this._buildJsonPrompt(targetLanguage, customPrompt, expectedCount, context, batchIndex, totalBatches);
     }
     if (this.translationWorkflow === 'ai') {
-      return this.createTimestampPrompt(targetLanguage, batchIndex, totalBatches);
+      return this.createTimestampPrompt(targetLanguage, customPrompt, batchIndex, totalBatches);
     }
     if (this.translationWorkflow === 'xml') {
       return this.createXmlBatchPrompt(targetLanguage, customPrompt, expectedCount, context, batchIndex, totalBatches);
@@ -2316,10 +2364,11 @@ The ${expectedCount} entries to translate follow.`;
   /**
    * Create translation prompt for timestamp-aware batches
    */
-  createTimestampPrompt(targetLanguage, batchIndex = 0, totalBatches = 1) {
+  createTimestampPrompt(targetLanguage, customPrompt = null, batchIndex = 0, totalBatches = 1) {
     const targetLabel = normalizeTargetLanguageForPrompt(targetLanguage);
-    const base = DEFAULT_TRANSLATION_PROMPT.replace('{target_language}', targetLabel);
-    return this.addBatchHeader(base, batchIndex, totalBatches);
+    const workflowContract = DEFAULT_TRANSLATION_PROMPT.replace('{target_language}', targetLabel);
+    const composedPrompt = composeWorkflowPrompt(targetLanguage, targetLabel, customPrompt, workflowContract);
+    return this.addBatchHeader(composedPrompt, batchIndex, totalBatches);
   }
 
   /**
@@ -2365,7 +2414,8 @@ YOUR RESPONSE MUST:
 - Contain EXACTLY ${expectedCount} numbered entries and NOTHING else
 
 The ${expectedCount} entries to translate follow.`;
-    return this.addBatchHeader(promptBody, batchIndex, totalBatches);
+    const composedPrompt = composeWorkflowPrompt(targetLanguage, targetLabel, customPrompt, promptBody);
+    return this.addBatchHeader(composedPrompt, batchIndex, totalBatches);
   }
 
   /**
